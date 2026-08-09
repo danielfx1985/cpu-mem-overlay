@@ -563,29 +563,16 @@ class FloatingMonitor(QWidget):
         self._draw_bar(painter, QRectF(92, 44, 62, 5), self.mem, mem_color)
 
     def _paint_full(self, painter: QPainter) -> None:
-        title_font = QFont("Segoe UI", 8, QFont.Weight.Medium)
-        painter.setFont(title_font)
-        painter.setPen(QColor(170, 190, 205, 180))
-        painter.drawText(
-            16, 10, 180, 16, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SYSTEM"
-        )
-
         cpu_color = self._usage_color(self.cpu, QColor(90, 200, 180), QColor(255, 120, 90))
         mem_color = self._usage_color(self.mem, QColor(120, 180, 255), QColor(255, 160, 70))
 
-        self._draw_ring(painter, QPoint(62, 72), 34, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%")
-        self._draw_ring(painter, QPoint(158, 72), 34, self.mem, mem_color, "MEM", f"{self.mem:.0f}%")
-
-        sub = QFont("Segoe UI", 7)
-        painter.setFont(sub)
-        painter.setPen(QColor(150, 170, 185, 160))
-        painter.drawText(
-            0,
-            108,
-            self.BASE_W,
-            14,
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-            f"{self.mem_used_gb:.1f} / {self.mem_total_gb:.1f} GB",
+        # 仅保留双环，尽量占满窗口
+        radius = 48
+        self._draw_ring(
+            painter, QPoint(56, 64), radius, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%"
+        )
+        self._draw_ring(
+            painter, QPoint(164, 64), radius, self.mem, mem_color, "MEM", f"{self.mem:.0f}%"
         )
 
     def _draw_bar(self, painter: QPainter, rect: QRectF, percent: float, color: QColor) -> None:
@@ -610,8 +597,10 @@ class FloatingMonitor(QWidget):
         value: str,
     ) -> None:
         cx, cy = float(center.x()), float(center.y())
+        stroke = max(7.0, radius * 0.18)
+        glow_r = radius + stroke
 
-        glow = QRadialGradient(cx, cy, radius + 8)
+        glow = QRadialGradient(cx, cy, glow_r)
         glow_color = QColor(color)
         glow_color.setAlpha(40)
         glow.setColorAt(0.55, QColor(0, 0, 0, 0))
@@ -619,10 +608,10 @@ class FloatingMonitor(QWidget):
         glow.setColorAt(1.0, QColor(0, 0, 0, 0))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(glow)
-        painter.drawEllipse(QPointF(cx, cy), radius + 8, radius + 8)
+        painter.drawEllipse(QPointF(cx, cy), glow_r, glow_r)
 
         track_pen = QPen(
-            QColor(255, 255, 255, 24), 7.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap
+            QColor(255, 255, 255, 24), stroke, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap
         )
         painter.setPen(track_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -630,24 +619,24 @@ class FloatingMonitor(QWidget):
         painter.drawArc(ring, 0, 360 * 16)
 
         span = int(-360 * 16 * max(0.0, min(100.0, percent)) / 100.0)
-        active = QPen(color, 7.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        active = QPen(color, stroke, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         painter.setPen(active)
         painter.drawArc(ring, 90 * 16, span)
 
-        label_font = QFont("Segoe UI", 7, QFont.Weight.Medium)
+        label_font = QFont("Segoe UI", max(7, int(radius * 0.18)), QFont.Weight.Medium)
         painter.setFont(label_font)
         painter.setPen(QColor(160, 180, 195, 190))
         painter.drawText(
-            QRectF(cx - 28, cy - 18, 56, 14),
+            QRectF(cx - 32, cy - 22, 64, 16),
             Qt.AlignmentFlag.AlignCenter,
             label,
         )
 
-        value_font = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
+        value_font = QFont("Segoe UI", max(12, int(radius * 0.36)), QFont.Weight.DemiBold)
         painter.setFont(value_font)
         painter.setPen(QColor(240, 246, 250, 245))
         painter.drawText(
-            QRectF(cx - 30, cy - 2, 60, 22),
+            QRectF(cx - 36, cy - 4, 72, 26),
             Qt.AlignmentFlag.AlignCenter,
             value,
         )
@@ -658,7 +647,8 @@ class FloatingMonitor(QWidget):
             y = cy - radius * math.sin(angle)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(255, 255, 255, 220))
-            painter.drawEllipse(QPointF(x, y), 2.2, 2.2)
+            dot = max(2.2, stroke * 0.35)
+            painter.drawEllipse(QPointF(x, y), dot, dot)
 
 
 def _notify_existing_instance() -> bool:
