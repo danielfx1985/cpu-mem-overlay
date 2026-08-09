@@ -2,34 +2,91 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import winreg
 from pathlib import Path
 
 import psutil
-from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
+from PyQt6.QtCore import (
+    QLockFile,
+    QPoint,
+    QPointF,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QRadialGradient,
     QWheelEvent,
 )
-from PyQt6.QtWidgets import QApplication, QMenu, QWidget
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
-APP_DIR = Path(__file__).resolve().parent
+APP_NAME = "CPU Mem Overlay"
 AUTOSTART_NAME = "CpuMemOverlay"
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SINGLETON_KEY = "CpuMemOverlaySingleton"
+EMA_ALPHA = 0.35
+
+
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def settings_path() -> Path:
+    base = Path.home() / "AppData" / "Roaming" / "CpuMemOverlay"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "settings.json"
+
+
+def lock_path() -> Path:
+    base = Path.home() / "AppData" / "Local" / "CpuMemOverlay"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "instance.lock"
+
+
+def load_settings() -> dict:
+    path = settings_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    path = settings_path()
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def autostart_command() -> str:
-    """开机用 wscript 调 run.vbs，避免弹出命令行窗口。"""
-    vbs = APP_DIR / "run.vbs"
+    """优先启动打包后的 exe；开发模式走 run.vbs（会自动选 exe/pythonw）。"""
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+    for candidate in (app_dir() / "CpuMemOverlay.exe", app_dir() / "dist" / "CpuMemOverlay.exe"):
+        if candidate.exists():
+            return f'"{candidate}"'
+    vbs = app_dir() / "run.vbs"
     return f'wscript.exe "{vbs}"'
 
 
@@ -58,6 +115,52 @@ def set_autostart(enabled: bool) -> None:
                 pass
 
 
+def make_tray_icon() -> QIcon:
+    size = 64
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setBrush(QColor(22, 30, 40, 240))
+    painter.setPen(QPen(QColor(90, 200, 180, 220), 3))
+    painter.drawRoundedRect(4, 4, size - 8, size - 8, 14, 14)
+    pen = QPen(QColor(90, 200, 180), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawArc(14, 14, size - 28, size - 28, 40 * 16, 280 * 16)
+    painter.end()
+    return QIcon(pm)
+
+
+def ema(prev: float | None, value: float, alpha: float = EMA_ALPHA) -> float:
+    if prev is None:
+        return value
+    return prev * (1.0 - alpha) + value * alpha
+
+
+class Sampler(QThread):
+    """后台采样，避免阻塞 UI 绘制。"""
+
+    sample_ready = pyqtSignal(float, float, float, float)
+
+    def __init__(self, interval_ms: int = 1000, parent=None) -> None:
+        super().__init__(parent)
+        self._interval_ms = max(200, interval_ms)
+
+    def run(self) -> None:
+        psutil.cpu_percent(interval=None)
+        while not self.isInterruptionRequested():
+            cpu = float(psutil.cpu_percent(interval=None))
+            vm = psutil.virtual_memory()
+            self.sample_ready.emit(
+                cpu,
+                float(vm.percent),
+                vm.used / (1024**3),
+                vm.total / (1024**3),
+            )
+            self.msleep(self._interval_ms)
+
+
 class FloatingMonitor(QWidget):
     BASE_W = 220
     BASE_H = 128
@@ -74,11 +177,16 @@ class FloatingMonitor(QWidget):
         self.mem = 0.0
         self.mem_used_gb = 0.0
         self.mem_total_gb = 0.0
+        self._cpu_raw: float | None = None
+        self._mem_raw: float | None = None
         self.opacity_level = 0.88
         self._drag_offset: QPoint | None = None
         self._resizing = False
         self._compact = False
         self._scale = 1.0
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.timeout.connect(self._persist_settings)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -90,18 +198,86 @@ class FloatingMonitor(QWidget):
         self.setMouseTracking(True)
         self.setWindowOpacity(self.opacity_level)
         self.setToolTip(
-            "拖拽移动 · 右下角拖拽缩放 · 滚轮缩放 · 双击紧凑模式 · 右键菜单"
+            "拖拽移动 · 右下角拖拽缩放 · 滚轮缩放 · 双击紧凑模式 · 右键菜单 · 托盘退出"
         )
+
+        self._restore_settings()
         self._apply_size()
-        self._place_near_top_right()
+        if not self._has_saved_pos:
+            self._place_near_top_right()
 
-        # 预热 CPU 采样，避免首帧为 0
-        psutil.cpu_percent(interval=None)
+        self._sampler = Sampler(self.UPDATE_MS, self)
+        self._sampler.sample_ready.connect(self._on_sample)
+        self._sampler.start()
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh)
-        self._timer.start(self.UPDATE_MS)
-        self._refresh()
+        self._tray: QSystemTrayIcon | None = None
+        self._setup_tray()
+
+    def _restore_settings(self) -> None:
+        data = load_settings()
+        self._has_saved_pos = "x" in data and "y" in data
+        self._scale = self._clamp_scale(float(data.get("scale", 1.0)))
+        self._compact = bool(data.get("compact", False))
+        self.opacity_level = float(data.get("opacity", 0.88))
+        self.opacity_level = max(0.35, min(1.0, self.opacity_level))
+        self.setWindowOpacity(self.opacity_level)
+        if self._has_saved_pos:
+            self.move(int(data["x"]), int(data["y"]))
+
+    def _schedule_persist(self) -> None:
+        self._settings_timer.start(250)
+
+    def _persist_settings(self) -> None:
+        save_settings(
+            {
+                "x": self.x(),
+                "y": self.y(),
+                "scale": round(self._scale, 3),
+                "compact": self._compact,
+                "opacity": round(self.opacity_level, 3),
+            }
+        )
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(make_tray_icon(), self)
+        menu = QMenu()
+        menu.setStyleSheet(self._menu_style())
+        show_action = menu.addAction("显示 / 隐藏")
+        show_action.triggered.connect(self.toggle_visibility)
+        menu.addSeparator()
+        quit_action = menu.addAction("退出")
+        quit_action.triggered.connect(self._quit_app)
+        tray.setContextMenu(menu)
+        tray.setToolTip(APP_NAME)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray = tray
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.toggle_visibility()
+
+    def toggle_visibility(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.bring_to_front()
+
+    def bring_to_front(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        self._persist_settings()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _base_size(self) -> tuple[int, int]:
         if self._compact:
@@ -124,6 +300,7 @@ class FloatingMonitor(QWidget):
         self._scale = new_scale
         self._apply_size()
         self.update()
+        self._schedule_persist()
 
     def _place_near_top_right(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -136,12 +313,13 @@ class FloatingMonitor(QWidget):
         m = self.RESIZE_MARGIN
         return pos.x() >= self.width() - m and pos.y() >= self.height() - m
 
-    def _refresh(self) -> None:
-        self.cpu = float(psutil.cpu_percent(interval=None))
-        vm = psutil.virtual_memory()
-        self.mem = float(vm.percent)
-        self.mem_used_gb = vm.used / (1024**3)
-        self.mem_total_gb = vm.total / (1024**3)
+    def _on_sample(self, cpu: float, mem: float, used_gb: float, total_gb: float) -> None:
+        self._cpu_raw = ema(self._cpu_raw, cpu)
+        self._mem_raw = ema(self._mem_raw, mem)
+        self.cpu = self._cpu_raw
+        self.mem = self._mem_raw
+        self.mem_used_gb = used_gb
+        self.mem_total_gb = total_gb
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -185,12 +363,15 @@ class FloatingMonitor(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            moved_or_resized = self._resizing or self._drag_offset is not None
             self._resizing = False
             self._drag_offset = None
             if self._resize_hit(event.position().toPoint()):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
             else:
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
+            if moved_or_resized:
+                self._schedule_persist()
             event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
@@ -208,10 +389,9 @@ class FloatingMonitor(QWidget):
         self._set_scale(self._scale + step)
         event.accept()
 
-    def _show_menu(self, pos: QPoint) -> None:
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            """
+    @staticmethod
+    def _menu_style() -> str:
+        return """
             QMenu {
                 background: rgba(18, 24, 32, 230);
                 color: #e8eef4;
@@ -226,8 +406,11 @@ class FloatingMonitor(QWidget):
             QMenu::item:selected {
                 background: rgba(90, 200, 180, 55);
             }
-            """
-        )
+        """
+
+    def _show_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(self._menu_style())
 
         opacity_menu = menu.addMenu("透明度")
         for label, value in (
@@ -252,6 +435,9 @@ class FloatingMonitor(QWidget):
         toggle = menu.addAction("紧凑模式" if not self._compact else "完整模式")
         toggle.triggered.connect(self._toggle_compact)
 
+        hide_action = menu.addAction("隐藏到托盘")
+        hide_action.triggered.connect(self.hide)
+
         autostart = menu.addAction("开机启动")
         autostart.setCheckable(True)
         autostart.setChecked(is_autostart_enabled())
@@ -259,21 +445,29 @@ class FloatingMonitor(QWidget):
 
         menu.addSeparator()
         quit_action = menu.addAction("退出")
-        quit_action.triggered.connect(QApplication.instance().quit)
+        quit_action.triggered.connect(self._quit_app)
 
         menu.exec(pos)
 
     def _set_opacity(self, value: float) -> None:
         self.opacity_level = value
         self.setWindowOpacity(value)
+        self._schedule_persist()
 
     def _toggle_compact(self) -> None:
         self._compact = not self._compact
         self._apply_size()
         self.update()
+        self._schedule_persist()
 
     def _toggle_autostart(self, checked: bool) -> None:
         set_autostart(checked)
+
+    def shutdown(self) -> None:
+        self._persist_settings()
+        if self._sampler.isRunning():
+            self._sampler.requestInterruption()
+            self._sampler.wait(1500)
 
     @staticmethod
     def _usage_color(percent: float, cool: QColor, hot: QColor) -> QColor:
@@ -293,7 +487,6 @@ class FloatingMonitor(QWidget):
         s = self._scale
         radius = (18.0 if not self._compact else 14.0) * s
 
-        # 玻璃底
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
 
@@ -302,25 +495,21 @@ class FloatingMonitor(QWidget):
         fill.setColorAt(1.0, QColor(12, 16, 22, 220))
         painter.fillPath(path, fill)
 
-        # 顶部微光
         gloss = QLinearGradient(0, 0, 0, self.height() * 0.45)
         gloss.setColorAt(0.0, QColor(255, 255, 255, 28))
         gloss.setColorAt(1.0, QColor(255, 255, 255, 0))
         painter.fillPath(path, gloss)
 
-        # 边框
         border = QPen(QColor(255, 255, 255, 42))
         border.setWidthF(max(1.0, 1.2 * s))
         painter.setPen(border)
         painter.drawPath(path)
 
-        # 内描边
         inset = max(1.0, 1.2 * s)
         inner = QRectF(rect.adjusted(inset, inset, -inset, -inset))
         painter.setPen(QPen(QColor(90, 200, 180, 28), max(1.0, 1.0 * s)))
         painter.drawRoundedRect(inner, max(1.0, radius - inset), max(1.0, radius - inset))
 
-        # 内容按基准坐标绘制后整体缩放
         painter.save()
         painter.scale(s, s)
         if self._compact:
@@ -329,7 +518,6 @@ class FloatingMonitor(QWidget):
             self._paint_full(painter)
         painter.restore()
 
-        # 右下角缩放提示
         self._paint_resize_grip(painter)
 
     def _paint_resize_grip(self, painter: QPainter) -> None:
@@ -423,7 +611,6 @@ class FloatingMonitor(QWidget):
     ) -> None:
         cx, cy = float(center.x()), float(center.y())
 
-        # 外圈柔光（用 float 构造，避免 QPoint 重载在部分环境下崩溃）
         glow = QRadialGradient(cx, cy, radius + 8)
         glow_color = QColor(color)
         glow_color.setAlpha(40)
@@ -447,7 +634,6 @@ class FloatingMonitor(QWidget):
         painter.setPen(active)
         painter.drawArc(ring, 90 * 16, span)
 
-        # 中心文字
         label_font = QFont("Segoe UI", 7, QFont.Weight.Medium)
         painter.setFont(label_font)
         painter.setPen(QColor(160, 180, 195, 190))
@@ -466,7 +652,6 @@ class FloatingMonitor(QWidget):
             value,
         )
 
-        # 端点小圆点
         if percent > 0.5:
             angle = math.radians(90 - 360 * percent / 100.0)
             x = cx + radius * math.cos(angle)
@@ -476,17 +661,74 @@ class FloatingMonitor(QWidget):
             painter.drawEllipse(QPointF(x, y), 2.2, 2.2)
 
 
+def _notify_existing_instance() -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLETON_KEY)
+    if not socket.waitForConnected(300):
+        return False
+    socket.write(b"show\n")
+    socket.flush()
+    socket.waitForBytesWritten(300)
+    socket.disconnectFromServer()
+    return True
+
+
+def _install_singleton_server(window: FloatingMonitor) -> QLocalServer:
+    QLocalServer.removeServer(SINGLETON_KEY)
+    server = QLocalServer(window)
+
+    def on_new_connection() -> None:
+        client = server.nextPendingConnection()
+        if client is None:
+            return
+
+        def on_ready() -> None:
+            _ = client.readAll()
+            window.bring_to_front()
+            client.disconnectFromServer()
+
+        client.readyRead.connect(on_ready)
+
+    server.newConnection.connect(on_new_connection)
+    server.listen(SINGLETON_KEY)
+    return server
+
+
 def main() -> int:
-    # 高 DPI
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
-    app.setApplicationName("CPU Mem Overlay")
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName("CpuMemOverlay")
+
+    lock = QLockFile(str(lock_path()))
+    lock.setStaleLockTime(10_000)
+    if not lock.tryLock(100):
+        if _notify_existing_instance():
+            return 0
+        # 锁残留但进程已死时清理后重试
+        lock.removeStaleLockFile()
+        if not lock.tryLock(100):
+            if _notify_existing_instance():
+                return 0
+            return 1
 
     window = FloatingMonitor()
+    server = _install_singleton_server(window)
+    # 防止局部变量被回收导致锁提前释放
+    app._instance_lock = lock  # type: ignore[attr-defined]
+    app._instance_server = server  # type: ignore[attr-defined]
     window.show()
+
+    def on_about_to_quit() -> None:
+        window.shutdown()
+        server.close()
+        QLocalServer.removeServer(SINGLETON_KEY)
+        lock.unlock()
+
+    app.aboutToQuit.connect(on_about_to_quit)
     return app.exec()
 
 
