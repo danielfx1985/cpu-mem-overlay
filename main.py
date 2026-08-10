@@ -33,13 +33,49 @@ from PyQt6.QtGui import (
     QWheelEvent,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PyQt6.QtWidgets import QApplication, QColorDialog, QMenu, QSystemTrayIcon, QWidget
 
 APP_NAME = "CPU Mem Overlay"
 AUTOSTART_NAME = "CpuMemOverlay"
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SINGLETON_KEY = "CpuMemOverlaySingleton"
 EMA_ALPHA = 0.35
+HOT_COLOR = QColor(255, 120, 90)
+
+# 主题：CPU / MEM 常态色；高占用时统一过渡到暖色
+COLOR_THEMES: dict[str, dict] = {
+    "mint": {
+        "label": "薄荷绿",
+        "cpu": "#5AC8B4",
+        "mem": "#78B4FF",
+    },
+    "sky": {
+        "label": "晴空蓝",
+        "cpu": "#4DA3FF",
+        "mem": "#7EC8FF",
+    },
+    "amber": {
+        "label": "琥珀金",
+        "cpu": "#F0B35A",
+        "mem": "#E8C87A",
+    },
+    "rose": {
+        "label": "玫瑰粉",
+        "cpu": "#E891B0",
+        "mem": "#C9A0DC",
+    },
+    "lime": {
+        "label": "青柠",
+        "cpu": "#9CCC65",
+        "mem": "#80CBC4",
+    },
+    "mono": {
+        "label": "银灰",
+        "cpu": "#C5D0DA",
+        "mem": "#A8B4C0",
+    },
+}
+DEFAULT_THEME = "mint"
 
 
 def app_dir() -> Path:
@@ -115,21 +151,31 @@ def set_autostart(enabled: bool) -> None:
                 pass
 
 
-def make_tray_icon() -> QIcon:
+def make_tray_icon(accent: QColor | None = None) -> QIcon:
+    color = QColor(accent) if accent is not None else QColor("#5AC8B4")
     size = 64
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setBrush(QColor(22, 30, 40, 240))
-    painter.setPen(QPen(QColor(90, 200, 180, 220), 3))
+    rim = QColor(color)
+    rim.setAlpha(220)
+    painter.setPen(QPen(rim, 3))
     painter.drawRoundedRect(4, 4, size - 8, size - 8, 14, 14)
-    pen = QPen(QColor(90, 200, 180), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    pen = QPen(color, 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawArc(14, 14, size - 28, size - 28, 40 * 16, 280 * 16)
     painter.end()
     return QIcon(pm)
+
+
+def parse_color(value: str, fallback: str) -> QColor:
+    color = QColor(value)
+    if not color.isValid():
+        color = QColor(fallback)
+    return color
 
 
 def ema(prev: float | None, value: float, alpha: float = EMA_ALPHA) -> float:
@@ -164,8 +210,6 @@ class Sampler(QThread):
 class FloatingMonitor(QWidget):
     BASE_W = 220
     BASE_H = 128
-    COMPACT_W = 168
-    COMPACT_H = 56
     MIN_SCALE = 0.65
     MAX_SCALE = 2.8
     RESIZE_MARGIN = 16
@@ -182,8 +226,11 @@ class FloatingMonitor(QWidget):
         self.opacity_level = 0.88
         self._drag_offset: QPoint | None = None
         self._resizing = False
-        self._compact = False
         self._scale = 1.0
+        self._theme = DEFAULT_THEME
+        self._cpu_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["cpu"], "#5AC8B4")
+        self._mem_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["mem"], "#78B4FF")
+        self._tray: QSystemTrayIcon | None = None
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.timeout.connect(self._persist_settings)
@@ -197,9 +244,7 @@ class FloatingMonitor(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setMouseTracking(True)
         self.setWindowOpacity(self.opacity_level)
-        self.setToolTip(
-            "拖拽移动 · 右下角拖拽缩放 · 滚轮缩放 · 双击紧凑模式 · 右键菜单 · 托盘退出"
-        )
+        self.setToolTip("拖拽移动 · 右下角拖拽缩放 · 滚轮缩放 · 右键菜单 · 托盘退出")
 
         self._restore_settings()
         self._apply_size()
@@ -209,18 +254,24 @@ class FloatingMonitor(QWidget):
         self._sampler = Sampler(self.UPDATE_MS, self)
         self._sampler.sample_ready.connect(self._on_sample)
         self._sampler.start()
-
-        self._tray: QSystemTrayIcon | None = None
         self._setup_tray()
 
     def _restore_settings(self) -> None:
         data = load_settings()
         self._has_saved_pos = "x" in data and "y" in data
         self._scale = self._clamp_scale(float(data.get("scale", 1.0)))
-        self._compact = bool(data.get("compact", False))
         self.opacity_level = float(data.get("opacity", 0.88))
         self.opacity_level = max(0.35, min(1.0, self.opacity_level))
         self.setWindowOpacity(self.opacity_level)
+
+        theme = str(data.get("theme", DEFAULT_THEME))
+        if theme in COLOR_THEMES:
+            self._apply_theme(theme, persist=False)
+        else:
+            self._theme = "custom"
+            self._cpu_color = parse_color(str(data.get("cpu_color", "#5AC8B4")), "#5AC8B4")
+            self._mem_color = parse_color(str(data.get("mem_color", "#78B4FF")), "#78B4FF")
+
         if self._has_saved_pos:
             self.move(int(data["x"]), int(data["y"]))
 
@@ -233,15 +284,17 @@ class FloatingMonitor(QWidget):
                 "x": self.x(),
                 "y": self.y(),
                 "scale": round(self._scale, 3),
-                "compact": self._compact,
                 "opacity": round(self.opacity_level, 3),
+                "theme": self._theme,
+                "cpu_color": self._cpu_color.name(QColor.NameFormat.HexRgb),
+                "mem_color": self._mem_color.name(QColor.NameFormat.HexRgb),
             }
         )
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        tray = QSystemTrayIcon(make_tray_icon(), self)
+        tray = QSystemTrayIcon(make_tray_icon(self._cpu_color), self)
         menu = QMenu()
         menu.setStyleSheet(self._menu_style())
         show_action = menu.addAction("显示 / 隐藏")
@@ -254,6 +307,10 @@ class FloatingMonitor(QWidget):
         tray.activated.connect(self._on_tray_activated)
         tray.show()
         self._tray = tray
+
+    def _refresh_tray_icon(self) -> None:
+        if self._tray is not None:
+            self._tray.setIcon(make_tray_icon(self._cpu_color))
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -279,15 +336,9 @@ class FloatingMonitor(QWidget):
         if app is not None:
             app.quit()
 
-    def _base_size(self) -> tuple[int, int]:
-        if self._compact:
-            return self.COMPACT_W, self.COMPACT_H
-        return self.BASE_W, self.BASE_H
-
     def _apply_size(self) -> None:
-        bw, bh = self._base_size()
-        w = max(1, int(round(bw * self._scale)))
-        h = max(1, int(round(bh * self._scale)))
+        w = max(1, int(round(self.BASE_W * self._scale)))
+        h = max(1, int(round(self.BASE_H * self._scale)))
         self.setFixedSize(w, h)
 
     def _clamp_scale(self, scale: float) -> float:
@@ -345,8 +396,7 @@ class FloatingMonitor(QWidget):
             global_pos = event.globalPosition().toPoint()
             new_w = max(1, global_pos.x() - top_left.x())
             new_h = max(1, global_pos.y() - top_left.y())
-            bw, bh = self._base_size()
-            scale = max(new_w / bw, new_h / bh)
+            scale = max(new_w / self.BASE_W, new_h / self.BASE_H)
             self._set_scale(scale)
             event.accept()
             return
@@ -372,13 +422,6 @@ class FloatingMonitor(QWidget):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
             if moved_or_resized:
                 self._schedule_persist()
-            event.accept()
-
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and not self._resize_hit(
-            event.position().toPoint()
-        ):
-            self._toggle_compact()
             event.accept()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
@@ -432,8 +475,17 @@ class FloatingMonitor(QWidget):
             action = size_menu.addAction(label)
             action.triggered.connect(lambda _=False, s=scale: self._set_scale(s))
 
-        toggle = menu.addAction("紧凑模式" if not self._compact else "完整模式")
-        toggle.triggered.connect(self._toggle_compact)
+        color_menu = menu.addMenu("颜色")
+        for key, theme in COLOR_THEMES.items():
+            action = color_menu.addAction(theme["label"])
+            action.setCheckable(True)
+            action.setChecked(self._theme == key)
+            action.triggered.connect(lambda _=False, k=key: self._apply_theme(k))
+        color_menu.addSeparator()
+        cpu_custom = color_menu.addAction("自定义 CPU...")
+        cpu_custom.triggered.connect(lambda: self._pick_color("cpu"))
+        mem_custom = color_menu.addAction("自定义 MEM...")
+        mem_custom.triggered.connect(lambda: self._pick_color("mem"))
 
         hide_action = menu.addAction("隐藏到托盘")
         hide_action.triggered.connect(self.hide)
@@ -454,9 +506,29 @@ class FloatingMonitor(QWidget):
         self.setWindowOpacity(value)
         self._schedule_persist()
 
-    def _toggle_compact(self) -> None:
-        self._compact = not self._compact
-        self._apply_size()
+    def _apply_theme(self, theme_key: str, persist: bool = True) -> None:
+        theme = COLOR_THEMES.get(theme_key)
+        if theme is None:
+            return
+        self._theme = theme_key
+        self._cpu_color = parse_color(theme["cpu"], "#5AC8B4")
+        self._mem_color = parse_color(theme["mem"], "#78B4FF")
+        self._refresh_tray_icon()
+        self.update()
+        if persist:
+            self._schedule_persist()
+
+    def _pick_color(self, which: str) -> None:
+        current = self._cpu_color if which == "cpu" else self._mem_color
+        color = QColorDialog.getColor(current, self, "选择颜色")
+        if not color.isValid():
+            return
+        if which == "cpu":
+            self._cpu_color = color
+        else:
+            self._mem_color = color
+        self._theme = "custom"
+        self._refresh_tray_icon()
         self.update()
         self._schedule_persist()
 
@@ -485,7 +557,7 @@ class FloatingMonitor(QWidget):
 
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         s = self._scale
-        radius = (18.0 if not self._compact else 14.0) * s
+        radius = 18.0 * s
 
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
@@ -507,15 +579,14 @@ class FloatingMonitor(QWidget):
 
         inset = max(1.0, 1.2 * s)
         inner = QRectF(rect.adjusted(inset, inset, -inset, -inset))
-        painter.setPen(QPen(QColor(90, 200, 180, 28), max(1.0, 1.0 * s)))
+        accent = QColor(self._cpu_color)
+        accent.setAlpha(40)
+        painter.setPen(QPen(accent, max(1.0, 1.0 * s)))
         painter.drawRoundedRect(inner, max(1.0, radius - inset), max(1.0, radius - inset))
 
         painter.save()
         painter.scale(s, s)
-        if self._compact:
-            self._paint_compact(painter)
-        else:
-            self._paint_full(painter)
+        self._paint_gauges(painter)
         painter.restore()
 
         self._paint_resize_grip(painter)
@@ -528,45 +599,10 @@ class FloatingMonitor(QWidget):
             painter.setBrush(QColor(210, 230, 235, alpha))
             painter.drawEllipse(QPointF(x + i * 3.2, y + i * 3.2), 1.5, 1.5)
 
-    def _paint_compact(self, painter: QPainter) -> None:
-        cpu_color = self._usage_color(self.cpu, QColor(90, 200, 180), QColor(255, 120, 90))
-        mem_color = self._usage_color(self.mem, QColor(120, 180, 255), QColor(255, 160, 70))
+    def _paint_gauges(self, painter: QPainter) -> None:
+        cpu_color = self._usage_color(self.cpu, self._cpu_color, HOT_COLOR)
+        mem_color = self._usage_color(self.mem, self._mem_color, HOT_COLOR)
 
-        font = QFont("Segoe UI", 10, QFont.Weight.DemiBold)
-        painter.setFont(font)
-        painter.setPen(QColor(230, 238, 244, 235))
-        painter.drawText(
-            14, 22, 70, 20, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "CPU"
-        )
-        painter.drawText(
-            14,
-            34,
-            140,
-            20,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"{self.cpu:4.1f}%",
-        )
-
-        painter.drawText(
-            92, 22, 70, 20, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MEM"
-        )
-        painter.drawText(
-            92,
-            34,
-            140,
-            20,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            f"{self.mem:4.1f}%",
-        )
-
-        self._draw_bar(painter, QRectF(14, 44, 68, 5), self.cpu, cpu_color)
-        self._draw_bar(painter, QRectF(92, 44, 62, 5), self.mem, mem_color)
-
-    def _paint_full(self, painter: QPainter) -> None:
-        cpu_color = self._usage_color(self.cpu, QColor(90, 200, 180), QColor(255, 120, 90))
-        mem_color = self._usage_color(self.mem, QColor(120, 180, 255), QColor(255, 160, 70))
-
-        # 仅保留双环，尽量占满窗口
         radius = 48
         self._draw_ring(
             painter, QPoint(56, 64), radius, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%"
@@ -574,17 +610,6 @@ class FloatingMonitor(QWidget):
         self._draw_ring(
             painter, QPoint(164, 64), radius, self.mem, mem_color, "MEM", f"{self.mem:.0f}%"
         )
-
-    def _draw_bar(self, painter: QPainter, rect: QRectF, percent: float, color: QColor) -> None:
-        track = QPainterPath()
-        track.addRoundedRect(rect, 3, 3)
-        painter.fillPath(track, QColor(255, 255, 255, 22))
-
-        width = max(3.0, rect.width() * max(0.0, min(100.0, percent)) / 100.0)
-        fill_rect = QRectF(rect.x(), rect.y(), width, rect.height())
-        fill = QPainterPath()
-        fill.addRoundedRect(fill_rect, 3, 3)
-        painter.fillPath(fill, color)
 
     def _draw_ring(
         self,
