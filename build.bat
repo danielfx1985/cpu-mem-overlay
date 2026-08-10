@@ -9,7 +9,7 @@ if errorlevel 1 (
 )
 
 echo Building CpuMemOverlay.exe ...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name CpuMemOverlay main.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name CpuMemOverlay --hidden-import=pythoncom --hidden-import=pywintypes --hidden-import=win32pdh --hidden-import=pynvml main.py
 if errorlevel 1 (
   echo Build failed.
   pause

@@ -9,6 +9,7 @@ import winreg
 from pathlib import Path
 
 import psutil
+from temperatures import TemperatureMonitor
 from PyQt6.QtCore import (
     QLockFile,
     QPoint,
@@ -48,31 +49,43 @@ COLOR_THEMES: dict[str, dict] = {
         "label": "薄荷绿",
         "cpu": "#5AC8B4",
         "mem": "#78B4FF",
+        "cpu_temp": "#FF9E80",
+        "gpu_temp": "#FFD180",
     },
     "sky": {
         "label": "晴空蓝",
         "cpu": "#4DA3FF",
         "mem": "#7EC8FF",
+        "cpu_temp": "#FF8A65",
+        "gpu_temp": "#FFB74D",
     },
     "amber": {
         "label": "琥珀金",
         "cpu": "#F0B35A",
         "mem": "#E8C87A",
+        "cpu_temp": "#FF7043",
+        "gpu_temp": "#FFA726",
     },
     "rose": {
         "label": "玫瑰粉",
         "cpu": "#E891B0",
         "mem": "#C9A0DC",
+        "cpu_temp": "#F48FB1",
+        "gpu_temp": "#CE93D8",
     },
     "lime": {
         "label": "青柠",
         "cpu": "#9CCC65",
         "mem": "#80CBC4",
+        "cpu_temp": "#FFAB91",
+        "gpu_temp": "#FFE082",
     },
     "mono": {
         "label": "银灰",
         "cpu": "#C5D0DA",
         "mem": "#A8B4C0",
+        "cpu_temp": "#B0BEC5",
+        "gpu_temp": "#90A4AE",
     },
 }
 DEFAULT_THEME = "mint"
@@ -187,29 +200,36 @@ def ema(prev: float | None, value: float, alpha: float = EMA_ALPHA) -> float:
 class Sampler(QThread):
     """后台采样，避免阻塞 UI 绘制。"""
 
-    sample_ready = pyqtSignal(float, float, float, float)
+    sample_ready = pyqtSignal(float, float, float, float, object, object)
 
     def __init__(self, interval_ms: int = 1000, parent=None) -> None:
         super().__init__(parent)
         self._interval_ms = max(200, interval_ms)
+        self._temps = TemperatureMonitor()
 
     def run(self) -> None:
         psutil.cpu_percent(interval=None)
         while not self.isInterruptionRequested():
             cpu = float(psutil.cpu_percent(interval=None))
             vm = psutil.virtual_memory()
+            reading = self._temps.read()
             self.sample_ready.emit(
                 cpu,
                 float(vm.percent),
                 vm.used / (1024**3),
                 vm.total / (1024**3),
+                reading.cpu_c,
+                reading.gpu_c,
             )
             self.msleep(self._interval_ms)
+
+    def stop_monitor(self) -> None:
+        self._temps.close()
 
 
 class FloatingMonitor(QWidget):
     BASE_W = 220
-    BASE_H = 128
+    BASE_H = 220
     MIN_SCALE = 0.65
     MAX_SCALE = 2.8
     RESIZE_MARGIN = 16
@@ -221,8 +241,12 @@ class FloatingMonitor(QWidget):
         self.mem = 0.0
         self.mem_used_gb = 0.0
         self.mem_total_gb = 0.0
+        self.cpu_temp: float | None = None
+        self.gpu_temp: float | None = None
         self._cpu_raw: float | None = None
         self._mem_raw: float | None = None
+        self._cpu_temp_raw: float | None = None
+        self._gpu_temp_raw: float | None = None
         self.opacity_level = 0.88
         self._drag_offset: QPoint | None = None
         self._resizing = False
@@ -230,6 +254,8 @@ class FloatingMonitor(QWidget):
         self._theme = DEFAULT_THEME
         self._cpu_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["cpu"], "#5AC8B4")
         self._mem_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["mem"], "#78B4FF")
+        self._cpu_temp_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["cpu_temp"], "#FF9E80")
+        self._gpu_temp_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["gpu_temp"], "#FFD180")
         self._tray: QSystemTrayIcon | None = None
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
@@ -244,7 +270,10 @@ class FloatingMonitor(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setMouseTracking(True)
         self.setWindowOpacity(self.opacity_level)
-        self.setToolTip("拖拽移动 · 右下角拖拽缩放 · 滚轮缩放 · 右键菜单 · 托盘退出")
+        self.setToolTip(
+            "拖拽移动 · 右下角缩放 · 滚轮缩放 · 右键菜单\n"
+            "温度：CPU 来自 Windows 热区，GPU 来自显卡驱动（AMD ADL / NVIDIA NVML）"
+        )
 
         self._restore_settings()
         self._apply_size()
@@ -271,6 +300,12 @@ class FloatingMonitor(QWidget):
             self._theme = "custom"
             self._cpu_color = parse_color(str(data.get("cpu_color", "#5AC8B4")), "#5AC8B4")
             self._mem_color = parse_color(str(data.get("mem_color", "#78B4FF")), "#78B4FF")
+            self._cpu_temp_color = parse_color(
+                str(data.get("cpu_temp_color", "#FF9E80")), "#FF9E80"
+            )
+            self._gpu_temp_color = parse_color(
+                str(data.get("gpu_temp_color", "#FFD180")), "#FFD180"
+            )
 
         if self._has_saved_pos:
             self.move(int(data["x"]), int(data["y"]))
@@ -288,6 +323,8 @@ class FloatingMonitor(QWidget):
                 "theme": self._theme,
                 "cpu_color": self._cpu_color.name(QColor.NameFormat.HexRgb),
                 "mem_color": self._mem_color.name(QColor.NameFormat.HexRgb),
+                "cpu_temp_color": self._cpu_temp_color.name(QColor.NameFormat.HexRgb),
+                "gpu_temp_color": self._gpu_temp_color.name(QColor.NameFormat.HexRgb),
             }
         )
 
@@ -364,13 +401,34 @@ class FloatingMonitor(QWidget):
         m = self.RESIZE_MARGIN
         return pos.x() >= self.width() - m and pos.y() >= self.height() - m
 
-    def _on_sample(self, cpu: float, mem: float, used_gb: float, total_gb: float) -> None:
+    def _on_sample(
+        self,
+        cpu: float,
+        mem: float,
+        used_gb: float,
+        total_gb: float,
+        cpu_temp: object,
+        gpu_temp: object,
+    ) -> None:
         self._cpu_raw = ema(self._cpu_raw, cpu)
         self._mem_raw = ema(self._mem_raw, mem)
         self.cpu = self._cpu_raw
         self.mem = self._mem_raw
         self.mem_used_gb = used_gb
         self.mem_total_gb = total_gb
+
+        if isinstance(cpu_temp, (int, float)):
+            self._cpu_temp_raw = ema(self._cpu_temp_raw, float(cpu_temp))
+            self.cpu_temp = self._cpu_temp_raw
+        else:
+            self.cpu_temp = None
+
+        if isinstance(gpu_temp, (int, float)):
+            self._gpu_temp_raw = ema(self._gpu_temp_raw, float(gpu_temp))
+            self.gpu_temp = self._gpu_temp_raw
+        else:
+            self.gpu_temp = None
+
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -482,10 +540,14 @@ class FloatingMonitor(QWidget):
             action.setChecked(self._theme == key)
             action.triggered.connect(lambda _=False, k=key: self._apply_theme(k))
         color_menu.addSeparator()
-        cpu_custom = color_menu.addAction("自定义 CPU...")
-        cpu_custom.triggered.connect(lambda: self._pick_color("cpu"))
-        mem_custom = color_menu.addAction("自定义 MEM...")
-        mem_custom.triggered.connect(lambda: self._pick_color("mem"))
+        for label, key in (
+            ("自定义 CPU...", "cpu"),
+            ("自定义 MEM...", "mem"),
+            ("自定义 CPU温度...", "cpu_temp"),
+            ("自定义 GPU温度...", "gpu_temp"),
+        ):
+            action = color_menu.addAction(label)
+            action.triggered.connect(lambda _=False, k=key: self._pick_color(k))
 
         hide_action = menu.addAction("隐藏到托盘")
         hide_action.triggered.connect(self.hide)
@@ -513,20 +575,28 @@ class FloatingMonitor(QWidget):
         self._theme = theme_key
         self._cpu_color = parse_color(theme["cpu"], "#5AC8B4")
         self._mem_color = parse_color(theme["mem"], "#78B4FF")
+        self._cpu_temp_color = parse_color(theme["cpu_temp"], "#FF9E80")
+        self._gpu_temp_color = parse_color(theme["gpu_temp"], "#FFD180")
         self._refresh_tray_icon()
         self.update()
         if persist:
             self._schedule_persist()
 
     def _pick_color(self, which: str) -> None:
-        current = self._cpu_color if which == "cpu" else self._mem_color
+        mapping = {
+            "cpu": "_cpu_color",
+            "mem": "_mem_color",
+            "cpu_temp": "_cpu_temp_color",
+            "gpu_temp": "_gpu_temp_color",
+        }
+        attr = mapping.get(which)
+        if attr is None:
+            return
+        current = getattr(self, attr)
         color = QColorDialog.getColor(current, self, "选择颜色")
         if not color.isValid():
             return
-        if which == "cpu":
-            self._cpu_color = color
-        else:
-            self._mem_color = color
+        setattr(self, attr, color)
         self._theme = "custom"
         self._refresh_tray_icon()
         self.update()
@@ -540,6 +610,7 @@ class FloatingMonitor(QWidget):
         if self._sampler.isRunning():
             self._sampler.requestInterruption()
             self._sampler.wait(1500)
+        self._sampler.stop_monitor()
 
     @staticmethod
     def _usage_color(percent: float, cool: QColor, hot: QColor) -> QColor:
@@ -599,16 +670,52 @@ class FloatingMonitor(QWidget):
             painter.setBrush(QColor(210, 230, 235, alpha))
             painter.drawEllipse(QPointF(x + i * 3.2, y + i * 3.2), 1.5, 1.5)
 
+    @staticmethod
+    def _temp_percent(temp: float | None) -> float:
+        if temp is None:
+            return 0.0
+        return max(0.0, min(100.0, (float(temp) - 20.0) / 80.0 * 100.0))
+
+    @staticmethod
+    def _format_temp(temp: float | None) -> str:
+        if temp is None:
+            return "—"
+        return f"{temp:.0f}°"
+
     def _paint_gauges(self, painter: QPainter) -> None:
         cpu_color = self._usage_color(self.cpu, self._cpu_color, HOT_COLOR)
         mem_color = self._usage_color(self.mem, self._mem_color, HOT_COLOR)
+        cpu_t_color = self._usage_color(
+            self._temp_percent(self.cpu_temp), self._cpu_temp_color, HOT_COLOR
+        )
+        gpu_t_color = self._usage_color(
+            self._temp_percent(self.gpu_temp), self._gpu_temp_color, HOT_COLOR
+        )
 
-        radius = 48
+        radius = 42
         self._draw_ring(
-            painter, QPoint(56, 64), radius, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%"
+            painter, QPoint(56, 56), radius, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%"
         )
         self._draw_ring(
-            painter, QPoint(164, 64), radius, self.mem, mem_color, "MEM", f"{self.mem:.0f}%"
+            painter, QPoint(164, 56), radius, self.mem, mem_color, "MEM", f"{self.mem:.0f}%"
+        )
+        self._draw_ring(
+            painter,
+            QPoint(56, 164),
+            radius,
+            self._temp_percent(self.cpu_temp),
+            cpu_t_color,
+            "CPU°",
+            self._format_temp(self.cpu_temp),
+        )
+        self._draw_ring(
+            painter,
+            QPoint(164, 164),
+            radius,
+            self._temp_percent(self.gpu_temp),
+            gpu_t_color,
+            "GPU°",
+            self._format_temp(self.gpu_temp),
         )
 
     def _draw_ring(
