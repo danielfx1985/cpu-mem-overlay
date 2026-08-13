@@ -89,6 +89,16 @@ COLOR_THEMES: dict[str, dict] = {
     },
 }
 DEFAULT_THEME = "mint"
+DEFAULT_BG = "#C8161E28"  # ARGB: alpha 200, rgb 22,30,40
+
+BG_PRESETS: dict[str, dict[str, str]] = {
+    "slate": {"label": "深灰蓝", "color": "#C8161E28"},
+    "ink": {"label": "墨黑", "color": "#D20C1014"},
+    "charcoal": {"label": "炭灰", "color": "#C822262C"},
+    "night": {"label": "午夜蓝", "color": "#C8121A2A"},
+    "forest": {"label": "森绿", "color": "#C8122018"},
+    "clear": {"label": "更透明", "color": "#8A161E28"},
+}
 
 
 def app_dir() -> Path:
@@ -191,6 +201,19 @@ def parse_color(value: str, fallback: str) -> QColor:
     return color
 
 
+def color_hex(color: QColor) -> str:
+    return color.name(QColor.NameFormat.HexArgb)
+
+
+def darken_color(color: QColor, factor: float = 0.72) -> QColor:
+    return QColor(
+        max(0, min(255, int(color.red() * factor))),
+        max(0, min(255, int(color.green() * factor))),
+        max(0, min(255, int(color.blue() * factor))),
+        color.alpha(),
+    )
+
+
 def ema(prev: float | None, value: float, alpha: float = EMA_ALPHA) -> float:
     if prev is None:
         return value
@@ -229,10 +252,12 @@ class Sampler(QThread):
 
 class FloatingMonitor(QWidget):
     BASE_W = 220
-    BASE_H = 220
+    BASE_H_USAGE = 114
+    BASE_H_TEMP = 220
     MIN_SCALE = 0.65
     MAX_SCALE = 2.8
     RESIZE_MARGIN = 16
+    CLICK_SLOP = 6
     UPDATE_MS = 1000
 
     def __init__(self) -> None:
@@ -249,13 +274,18 @@ class FloatingMonitor(QWidget):
         self._gpu_temp_raw: float | None = None
         self.opacity_level = 0.88
         self._drag_offset: QPoint | None = None
+        self._press_global: QPoint | None = None
+        self._dragged = False
         self._resizing = False
+        self._show_temps = True
         self._scale = 1.0
         self._theme = DEFAULT_THEME
         self._cpu_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["cpu"], "#5AC8B4")
         self._mem_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["mem"], "#78B4FF")
         self._cpu_temp_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["cpu_temp"], "#FF9E80")
         self._gpu_temp_color = parse_color(COLOR_THEMES[DEFAULT_THEME]["gpu_temp"], "#FFD180")
+        self._bg_color = parse_color(DEFAULT_BG, DEFAULT_BG)
+        self._bg_preset = "slate"
         self._tray: QSystemTrayIcon | None = None
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
@@ -270,10 +300,7 @@ class FloatingMonitor(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setMouseTracking(True)
         self.setWindowOpacity(self.opacity_level)
-        self.setToolTip(
-            "拖拽移动 · 右下角缩放 · 滚轮缩放 · 右键菜单\n"
-            "温度：CPU 来自 Windows 热区，GPU 来自显卡驱动（AMD ADL / NVIDIA NVML）"
-        )
+        self._update_tooltip()
 
         self._restore_settings()
         self._apply_size()
@@ -285,13 +312,26 @@ class FloatingMonitor(QWidget):
         self._sampler.start()
         self._setup_tray()
 
+    def _update_tooltip(self) -> None:
+        temp_state = "开" if self._show_temps else "关"
+        self.setToolTip(
+            "单击切换温度显示 · 拖拽移动 · 右下角缩放 · 滚轮缩放 · 右键菜单\n"
+            f"当前温度指示：{temp_state}\n"
+            "温度：CPU 来自 Windows 热区，GPU 来自显卡驱动（AMD ADL / NVIDIA NVML）"
+        )
+
+    def _base_h(self) -> int:
+        return self.BASE_H_TEMP if self._show_temps else self.BASE_H_USAGE
+
     def _restore_settings(self) -> None:
         data = load_settings()
         self._has_saved_pos = "x" in data and "y" in data
         self._scale = self._clamp_scale(float(data.get("scale", 1.0)))
+        self._show_temps = bool(data.get("show_temps", True))
         self.opacity_level = float(data.get("opacity", 0.88))
         self.opacity_level = max(0.35, min(1.0, self.opacity_level))
         self.setWindowOpacity(self.opacity_level)
+        self._update_tooltip()
 
         theme = str(data.get("theme", DEFAULT_THEME))
         if theme in COLOR_THEMES:
@@ -307,6 +347,13 @@ class FloatingMonitor(QWidget):
                 str(data.get("gpu_temp_color", "#FFD180")), "#FFD180"
             )
 
+        bg_preset = str(data.get("bg_preset", "slate"))
+        if bg_preset in BG_PRESETS and "bg_color" not in data:
+            self._apply_bg_preset(bg_preset, persist=False)
+        else:
+            self._bg_preset = bg_preset if bg_preset in BG_PRESETS else "custom"
+            self._bg_color = parse_color(str(data.get("bg_color", DEFAULT_BG)), DEFAULT_BG)
+
         if self._has_saved_pos:
             self.move(int(data["x"]), int(data["y"]))
 
@@ -320,11 +367,14 @@ class FloatingMonitor(QWidget):
                 "y": self.y(),
                 "scale": round(self._scale, 3),
                 "opacity": round(self.opacity_level, 3),
+                "show_temps": self._show_temps,
                 "theme": self._theme,
                 "cpu_color": self._cpu_color.name(QColor.NameFormat.HexRgb),
                 "mem_color": self._mem_color.name(QColor.NameFormat.HexRgb),
                 "cpu_temp_color": self._cpu_temp_color.name(QColor.NameFormat.HexRgb),
                 "gpu_temp_color": self._gpu_temp_color.name(QColor.NameFormat.HexRgb),
+                "bg_preset": self._bg_preset,
+                "bg_color": color_hex(self._bg_color),
             }
         )
 
@@ -375,7 +425,7 @@ class FloatingMonitor(QWidget):
 
     def _apply_size(self) -> None:
         w = max(1, int(round(self.BASE_W * self._scale)))
-        h = max(1, int(round(self.BASE_H * self._scale)))
+        h = max(1, int(round(self._base_h() * self._scale)))
         self.setFixedSize(w, h)
 
     def _clamp_scale(self, scale: float) -> float:
@@ -387,6 +437,13 @@ class FloatingMonitor(QWidget):
             return
         self._scale = new_scale
         self._apply_size()
+        self.update()
+        self._schedule_persist()
+
+    def _toggle_temps(self) -> None:
+        self._show_temps = not self._show_temps
+        self._apply_size()
+        self._update_tooltip()
         self.update()
         self._schedule_persist()
 
@@ -433,10 +490,14 @@ class FloatingMonitor(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
+            self._dragged = False
+            self._press_global = event.globalPosition().toPoint()
             if self._resize_hit(event.position().toPoint()):
                 self._resizing = True
+                self._drag_offset = None
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
             else:
+                self._resizing = False
                 self._drag_offset = (
                     event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 )
@@ -450,17 +511,24 @@ class FloatingMonitor(QWidget):
         pos = event.position().toPoint()
 
         if self._resizing and event.buttons() & Qt.MouseButton.LeftButton:
+            self._dragged = True
             top_left = self.frameGeometry().topLeft()
             global_pos = event.globalPosition().toPoint()
             new_w = max(1, global_pos.x() - top_left.x())
             new_h = max(1, global_pos.y() - top_left.y())
-            scale = max(new_w / self.BASE_W, new_h / self.BASE_H)
+            scale = max(new_w / self.BASE_W, new_h / self._base_h())
             self._set_scale(scale)
             event.accept()
             return
 
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            global_pos = event.globalPosition().toPoint()
+            if self._press_global is not None:
+                delta = global_pos - self._press_global
+                if abs(delta.x()) > self.CLICK_SLOP or abs(delta.y()) > self.CLICK_SLOP:
+                    self._dragged = True
+            if self._dragged:
+                self.move(global_pos - self._drag_offset)
             event.accept()
             return
 
@@ -471,14 +539,19 @@ class FloatingMonitor(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            moved_or_resized = self._resizing or self._drag_offset is not None
+            was_resizing = self._resizing
+            was_dragged = self._dragged
             self._resizing = False
             self._drag_offset = None
+            self._press_global = None
             if self._resize_hit(event.position().toPoint()):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
             else:
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
-            if moved_or_resized:
+
+            if not was_resizing and not was_dragged:
+                self._toggle_temps()
+            elif was_dragged or was_resizing:
                 self._schedule_persist()
             event.accept()
 
@@ -549,6 +622,21 @@ class FloatingMonitor(QWidget):
             action = color_menu.addAction(label)
             action.triggered.connect(lambda _=False, k=key: self._pick_color(k))
 
+        bg_menu = menu.addMenu("背景")
+        for key, preset in BG_PRESETS.items():
+            action = bg_menu.addAction(preset["label"])
+            action.setCheckable(True)
+            action.setChecked(self._bg_preset == key)
+            action.triggered.connect(lambda _=False, k=key: self._apply_bg_preset(k))
+        bg_menu.addSeparator()
+        bg_custom = bg_menu.addAction("自定义背景...")
+        bg_custom.triggered.connect(self._pick_bg_color)
+
+        temps = menu.addAction("显示温度")
+        temps.setCheckable(True)
+        temps.setChecked(self._show_temps)
+        temps.triggered.connect(lambda checked: self._set_show_temps(checked))
+
         hide_action = menu.addAction("隐藏到托盘")
         hide_action.triggered.connect(self.hide)
 
@@ -568,6 +656,15 @@ class FloatingMonitor(QWidget):
         self.setWindowOpacity(value)
         self._schedule_persist()
 
+    def _set_show_temps(self, enabled: bool) -> None:
+        if self._show_temps == enabled:
+            return
+        self._show_temps = enabled
+        self._apply_size()
+        self._update_tooltip()
+        self.update()
+        self._schedule_persist()
+
     def _apply_theme(self, theme_key: str, persist: bool = True) -> None:
         theme = COLOR_THEMES.get(theme_key)
         if theme is None:
@@ -578,6 +675,16 @@ class FloatingMonitor(QWidget):
         self._cpu_temp_color = parse_color(theme["cpu_temp"], "#FF9E80")
         self._gpu_temp_color = parse_color(theme["gpu_temp"], "#FFD180")
         self._refresh_tray_icon()
+        self.update()
+        if persist:
+            self._schedule_persist()
+
+    def _apply_bg_preset(self, preset_key: str, persist: bool = True) -> None:
+        preset = BG_PRESETS.get(preset_key)
+        if preset is None:
+            return
+        self._bg_preset = preset_key
+        self._bg_color = parse_color(preset["color"], DEFAULT_BG)
         self.update()
         if persist:
             self._schedule_persist()
@@ -599,6 +706,23 @@ class FloatingMonitor(QWidget):
         setattr(self, attr, color)
         self._theme = "custom"
         self._refresh_tray_icon()
+        self.update()
+        self._schedule_persist()
+
+    def _pick_bg_color(self) -> None:
+        dialog = QColorDialog(self._bg_color, self)
+        dialog.setOption(QColorDialog.ColorDialogOption.ShowAlphaChannel, True)
+        dialog.setWindowTitle("选择背景颜色")
+        if dialog.exec() != QColorDialog.DialogCode.Accepted:
+            return
+        color = dialog.currentColor()
+        if not color.isValid():
+            return
+        # 避免完全不透明或完全透明导致难看/看不见
+        if color.alpha() < 40:
+            color.setAlpha(40)
+        self._bg_color = color
+        self._bg_preset = "custom"
         self.update()
         self._schedule_persist()
 
@@ -633,9 +757,13 @@ class FloatingMonitor(QWidget):
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
 
+        top = QColor(self._bg_color)
+        bottom = darken_color(top, 0.7)
+        bottom.setAlpha(min(255, max(top.alpha(), top.alpha() + 20)))
+
         fill = QLinearGradient(0, 0, 0, self.height())
-        fill.setColorAt(0.0, QColor(22, 30, 40, 200))
-        fill.setColorAt(1.0, QColor(12, 16, 22, 220))
+        fill.setColorAt(0.0, top)
+        fill.setColorAt(1.0, bottom)
         painter.fillPath(path, fill)
 
         gloss = QLinearGradient(0, 0, 0, self.height() * 0.45)
@@ -685,19 +813,24 @@ class FloatingMonitor(QWidget):
     def _paint_gauges(self, painter: QPainter) -> None:
         cpu_color = self._usage_color(self.cpu, self._cpu_color, HOT_COLOR)
         mem_color = self._usage_color(self.mem, self._mem_color, HOT_COLOR)
-        cpu_t_color = self._usage_color(
-            self._temp_percent(self.cpu_temp), self._cpu_temp_color, HOT_COLOR
-        )
-        gpu_t_color = self._usage_color(
-            self._temp_percent(self.gpu_temp), self._gpu_temp_color, HOT_COLOR
-        )
 
+        # 占用环固定尺寸/位置，切换温度时不跳动
         radius = 42
         self._draw_ring(
             painter, QPoint(56, 56), radius, self.cpu, cpu_color, "CPU", f"{self.cpu:.0f}%"
         )
         self._draw_ring(
             painter, QPoint(164, 56), radius, self.mem, mem_color, "MEM", f"{self.mem:.0f}%"
+        )
+
+        if not self._show_temps:
+            return
+
+        cpu_t_color = self._usage_color(
+            self._temp_percent(self.cpu_temp), self._cpu_temp_color, HOT_COLOR
+        )
+        gpu_t_color = self._usage_color(
+            self._temp_percent(self.gpu_temp), self._gpu_temp_color, HOT_COLOR
         )
         self._draw_ring(
             painter,
